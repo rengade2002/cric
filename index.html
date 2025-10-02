@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Sparx-style DASH Player</title>
+
+  <!-- dash.js (latest stable via CDN) -->
+  <script src="https://cdn.dashjs.org/v4.0.4/dash.all.min.js"></script>
+
+  <style>
+    :root {
+      --bg: #0f1724;
+      --card: #0b1220;
+      --accent: #08a0ff;
+      --muted: #9aa6b2;
+      --white: #ecf1f8;
+    }
+    html,body { height:100%; margin:0; font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial; background: linear-gradient(180deg,#061022 0%, #071427 100%); color:var(--white); }
+    .wrap { max-width:1000px; margin:32px auto; padding:20px; background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.04)); border-radius:12px; box-shadow:0 6px 30px rgba(4,9,20,0.6); }
+    h1 { margin:0 0 8px 0; font-size:20px; }
+    p.muted { color:var(--muted); margin-top:0; margin-bottom:14px; font-size:13px }
+    .player-row { display:grid; grid-template-columns: 1fr 320px; gap:18px; align-items:start; }
+    video { width:100%; height:auto; border-radius:8px; background:#000; }
+    .controls { background:var(--card); padding:12px; border-radius:8px; }
+    label { font-size:13px; color:var(--muted); display:block; margin-bottom:6px;}
+    input[type="text"] { width:100%; padding:8px 10px; border-radius:6px; border:1px solid rgba(255,255,255,0.06); background:transparent; color:var(--white); }
+    button { margin-top:8px; padding:8px 10px; border-radius:8px; border:0; background:var(--accent); color:#052028; font-weight:600; cursor:pointer; }
+    .meta { margin-top:14px; font-size:13px; color:var(--muted); }
+    pre { background:#051423; padding:10px; border-radius:6px; color: #bcd7ff; font-size:12px; overflow:auto; max-height:220px; }
+    .error { color:#ff6b6b; font-weight:600; margin-top:8px; }
+    .small { font-size:12px; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Sparx-style DASH Player</h1>
+    <p class="muted">Paste a DASH manifest in <code>?id=MANIFEST_URL</code>. Optionally pass <code>&key=...</code> for ClearKey (or license tokens).</p>
+
+    <div class="player-row">
+      <div>
+        <video id="video" controls playsinline></video>
+        <div class="meta" id="status">Status: <span id="statustext">idle</span></div>
+        <div class="meta">Manifest (from query): <code id="manifestDisplay"></code></div>
+        <div class="meta">Key param (from query): <code id="keyDisplay"></code></div>
+        <div id="err" class="error" style="display:none;"></div>
+      </div>
+
+      <div class="controls">
+        <label>Manifest URL (query param <code>id</code>)</label>
+        <input id="manifestInput" placeholder="https://.../manifest.mpd" />
+        <label style="margin-top:10px">Key param (query param <code>key</code>)</label>
+        <input id="keyInput" placeholder="kid:key (hex:hex) or token or licenseURL" />
+        <button id="loadBtn">Load & Play</button>
+
+        <div style="margin-top:12px;">
+          <div class="small">Hints:</div>
+          <div class="small">• For ClearKey use <code>kid:key</code> in HEX (example: <code>1f2e...:a0b1...</code>).</div>
+          <div class="small">• For real Widevine/PlayReady use a license server and pass the license URL or token in the <code>key</code> field (see README below).</div>
+        </div>
+
+        <div style="margin-top:12px">
+          <div class="small">Player logs:</div>
+          <pre id="log">log ready...</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/*
+  Minimal DASH player:
+  - Reads ?id=MANIFEST_URL and ?key=VALUE
+  - If key is "kid:key" hex pair -> configure ClearKey automatically
+  - Otherwise passes key through in player.protectionData. Use this to set license servers.
+  - Uses dash.js v4+ API (player.initialize, setProtectionData)
+*/
+
+const qs = new URLSearchParams(window.location.search);
+const manifestFromQuery = qs.get('id') || '';
+const keyFromQuery = qs.get('key') || '';
+
+const video = document.getElementById('video');
+const manifestInput = document.getElementById('manifestInput');
+const keyInput = document.getElementById('keyInput');
+const loadBtn = document.getElementById('loadBtn');
+const manifestDisplay = document.getElementById('manifestDisplay');
+const keyDisplay = document.getElementById('keyDisplay');
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('statustext');
+const errEl = document.getElementById('err');
+
+// initialize UI fields from query
+manifestInput.value = manifestFromQuery;
+keyInput.value = keyFromQuery;
+manifestDisplay.textContent = manifestFromQuery || '(none)';
+keyDisplay.textContent = keyFromQuery || '(none)';
+
+let player = null;
+
+function log(...args){
+  console.log(...args);
+  logEl.textContent = (new Date()).toLocaleTimeString() + '  ' + args.map(a=> (typeof a==='object'? JSON.stringify(a): String(a))).join(' ') + "\n" + logEl.textContent;
+}
+function setStatus(s){ statusEl.textContent = s; log('STATUS', s); }
+function showError(s){ errEl.style.display='block'; errEl.textContent = s; log('ERROR', s); }
+
+function hexToBase64Url(hex) {
+  if (!hex) return '';
+  // normalize: remove 0x and odd length
+  hex = hex.replace(/^0x/i, '');
+  if (hex.length % 2) hex = '0' + hex;
+  // convert hex -> bytes -> base64
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) bytes[i/2] = parseInt(hex.substr(i,2), 16);
+  // base64
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, Array.prototype.slice.call(bytes, i, Math.min(i + chunkSize, bytes.length)));
+  }
+  let b64 = btoa(binary);
+  // convert to base64url
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function configureProtectionDataFromKey(key) {
+  // If key looks like hexKid:hexKey (two hex strings separated by colon)
+  // we convert to base64url and return protectionData for ClearKey
+  if (!key) return null;
+  const pairMatch = key.trim().match(/^([0-9a-fA-F]+):([0-9a-fA-F]+)$/);
+  if (pairMatch) {
+    const kidHex = pairMatch[1];
+    const keyHex = pairMatch[2];
+    const kidB64url = hexToBase64Url(kidHex);
+    const keyB64url = hexToBase64Url(keyHex);
+    // protectionData for ClearKey in dash.js: set under org.w3.clearkey
+    const clearkeys = {};
+    clearkeys[kidB64url] = keyB64url;
+    return {
+      "org.w3.clearkey": {
+        clearkeys: clearkeys,
+        // optional: a session id/name
+        persistentState: false
+      }
+    };
+  }
+  // Otherwise, key might be a license server URL or JWT token.
+  // Return an object you can use to further configure DRM license servers.
+  // We'll just pass it through in "other" property for demonstration.
+  return { custom: key };
+}
+
+function destroyPlayerIfAny() {
+  if (player) {
+    try { player.reset(); } catch(e){ console.warn(e); }
+    player = null;
+  }
+}
+
+async function loadAndPlayManifest(manifestUrl, keyParam) {
+  errEl.style.display='none';
+  if (!manifestUrl) {
+    showError('No manifest URL provided.');
+    return;
+  }
+
+  setStatus('loading');
+  destroyPlayerIfAny();
+
+  // instantiate dash.js player
+  player = dashjs.MediaPlayer().create();
+  player.getDebug().setLogToBrowserConsole(false);
+  player.initialize(video, null, false);
+
+  // configure protectionData if key looks like ClearKey, or forward license info
+  const prot = configureProtectionDataFromKey(keyParam);
+  log('configureProtectionDataFromKey =>', prot);
+
+  if (prot && prot["org.w3.clearkey"]) {
+    // ClearKey config
+    player.setProtectionData(prot);
+    log('Set protectionData for ClearKey', prot);
+  } else if (prot && prot.custom) {
+    // If user supplied license server URL or token, you would do:
+    // Example: keyParam might be "widevine:LICENSE_URL" or a raw license url.
+    // We'll try to treat it as a license URL mapping if prefixed.
+    // This is a simple heuristic - adapt to your backend.
+    const raw = prot.custom;
+    // If user passes "widevine:LICENSE_URL" or "playready:LICENSE_URL"
+    const m = raw.match(/^(widevine|playready|clearkey):(.+)$/i);
+    if (m) {
+      const keySystem = m[1].toLowerCase();
+      const licenseUrl = m[2];
+      const protectionData = {};
+      if (keySystem === 'widevine') {
+        protectionData['com.widevine.alpha'] = { serverURL: licenseUrl };
+      } else if (keySystem === 'playready') {
+        protectionData['com.microsoft.playready'] = { serverURL: licenseUrl };
+      } else if (keySystem === 'clearkey') {
+        // If user explicitly passed clearkey:BASE64KID:BASE64KEY (not implemented)
+        // For clarity, clearkey hex:hex format above is simpler.
+      }
+      player.setProtectionData(protectionData);
+      log('Set protectionData for license server', protectionData);
+    } else {
+      // Not a recognized license server pattern: we simply attach to dash.js as extra data
+      // Developers can modify the code to use this token in license requests.
+      log('Unrecognized key format; pass through for custom handling:', raw);
+      // Example of hooking into EME license requests would be necessary for custom flows:
+      // player.on(dashjs.MediaPlayer.events.LICENSE_REQUESTED, function(e) { ... })
+    }
+  }
+
+  // Optional player config: ABR, initial bitrate, buffer, etc.
+  player.updateSettings({
+    'streaming': {
+      'abr': {
+        'useDefaultABRRules': true
+      },
+      'scheduleWhilePaused': true
+    }
+  });
+
+  // Listen to player events for debugging
+  player.on(dashjs.MediaPlayer.events.ERROR, (e) => {
+    log('DASH.js ERROR', e);
+    showError('Playback error: ' + (e && e.error ? e.error : 'unknown'));
+    setStatus('error');
+  });
+  player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => setStatus('initialized'));
+  player.on(dashjs.MediaPlayer.events.PLAYBACK_STARTED, () => setStatus('playing'));
+  player.on(dashjs.MediaPlayer.events.PLAYBACK_PAUSED, () => setStatus('paused'));
+  player.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, (e) => {
+    log('Quality changed', e);
+  });
+
+  try {
+    player.attachSource(manifestUrl);
+    log('Attached source:', manifestUrl);
+    manifestDisplay.textContent = manifestUrl;
+    keyDisplay.textContent = keyParam || '(none)';
+    // autoplay attempt
+    try { await video.play(); } catch(err) { log('Autoplay prevented, user interaction required', err); }
+  } catch (e) {
+    console.error(e);
+    showError('Failed to attach manifest: ' + e.message);
+    setStatus('error');
+  }
+}
+
+// load on button click
+loadBtn.addEventListener('click', () => {
+  const manifestUrl = manifestInput.value.trim();
+  const keyVal = keyInput.value.trim();
+  loadAndPlayManifest(manifestUrl, keyVal);
+});
+
+// If we have query params, auto-load once
+if (manifestFromQuery) {
+  // small async schedule to let UI render
+  setTimeout(() => loadAndPlayManifest(manifestFromQuery, keyFromQuery), 150);
+}
+
+</script>
+</body>
+</html>
